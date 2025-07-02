@@ -6,10 +6,22 @@ from pyproj import CRS, Transformer
 
 st.title("Football Field Maintenance Waypoint Generator")
 
-# --- UTM corner coordinates input (default from paper's Table 1) ---
-st.subheader("UTM Corner Coordinates (Easting, Northing)")
+# --- Choose coordinate input type ---
+coord_type = st.radio("Coordinate Input Type", ["UTM Coordinates", "Latitude/Longitude"])
 
-default_utm_coords = [
+# Default coordinates from the paper (Table 1), approx lat/lon near Denmark
+default_latlon = [
+    "56.456359,9.402698",
+    "56.456339,9.402720",
+    "56.455373,9.402473",
+    "56.455357,9.402434",
+    "56.455438,9.401313",
+    "56.455455,9.401286",
+    "56.456427,9.401540",
+    "56.456447,9.401577"
+]
+
+default_utm = [
     "561083.21,6251241.04",
     "561106.42,6251242.99",
     "561080.36,6250132.75",
@@ -20,55 +32,75 @@ default_utm_coords = [
     "561036.85,6251250.76"
 ]
 
-utm_coords = [
-    st.text_input(f"Point {i+1} (Easting, Northing)", default_utm_coords[i])
-    for i in range(8)
-]
+points = []
 
-# Parse UTM points
-utm_pts = []
+if coord_type == "UTM Coordinates":
+    st.subheader("Enter UTM Coordinates (Easting, Northing)")
+    coords_input = [
+        st.text_input(f"Point {i+1} (Easting, Northing)", default_utm[i])
+        for i in range(8)
+    ]
+else:
+    st.subheader("Enter Latitude / Longitude Coordinates (Decimal Degrees)")
+    coords_input = [
+        st.text_input(f"Point {i+1} (Latitude, Longitude)", default_latlon[i])
+        for i in range(8)
+    ]
+
+# Parse inputs
 parse_error = False
-for txt in utm_coords:
+for txt in coords_input:
     try:
-        e, n = map(float, txt.split(","))
-        utm_pts.append((e, n))
+        a, b = map(float, txt.split(","))
+        points.append((a, b))
     except:
-        st.error("Invalid UTM input. Use format: Easting,Northing")
+        st.error("Invalid coordinate input. Use format: number,number")
         parse_error = True
         break
 
 if parse_error:
     st.stop()
 
-utm_pts = np.array(utm_pts)
+points = np.array(points)
 
-# Use first point as origin
+# --- If input is lat/lon, convert to UTM for internal calculations ---
+if coord_type == "Latitude/Longitude":
+    # Ask user for UTM zone and hemisphere to use
+    st.subheader("UTM Zone and Hemisphere for internal projection")
+    utm_zone = st.number_input("UTM Zone Number", min_value=1, max_value=60, value=32)
+    hemisphere = st.selectbox("Hemisphere", options=["N", "S"], index=0)
+
+    wgs84_crs = CRS.from_epsg(4326)
+    if hemisphere == "N":
+        utm_crs = CRS.from_dict({"proj": "utm", "zone": utm_zone, "south": False})
+    else:
+        utm_crs = CRS.from_dict({"proj": "utm", "zone": utm_zone, "south": True})
+
+    transformer_wgs2utm = Transformer.from_crs(wgs84_crs, utm_crs, always_xy=True)
+    transformer_utm2wgs = Transformer.from_crs(utm_crs, wgs84_crs, always_xy=True)
+
+    utm_pts = np.array([transformer_wgs2utm.transform(lon, lat) for lat, lon in points])
+else:
+    # Input already in UTM
+    utm_zone = st.number_input("UTM Zone Number (confirm)", min_value=1, max_value=60, value=32)
+    hemisphere = st.selectbox("Hemisphere (confirm)", options=["N", "S"], index=0)
+
+    if hemisphere == "N":
+        utm_crs = CRS.from_dict({"proj": "utm", "zone": utm_zone, "south": False})
+    else:
+        utm_crs = CRS.from_dict({"proj": "utm", "zone": utm_zone, "south": True})
+
+    wgs84_crs = CRS.from_epsg(4326)
+    transformer_utm2wgs = Transformer.from_crs(utm_crs, wgs84_crs, always_xy=True)
+    transformer_wgs2utm = Transformer.from_crs(wgs84_crs, utm_crs, always_xy=True)
+
+    utm_pts = points
+
+# Reference origin point (for local coordinate system)
 E0, N0 = utm_pts[0]
 local_pts_orig = utm_pts - np.array([E0, N0])
 
-# --- Detect UTM zone and setup CRS ---
-# Assuming all points in same zone; calculate from first point
-zone_number = int((E0 // 1000000) % 100)  # Rough hack; better from lat/lon but let's do lat/lon for UTM zone
-
-# Instead, convert first UTM point back to lat/lon (approximate):
-# For that we must guess UTM zone from lat/lon - better to prompt user for zone or lat/lon directly
-
-# Let's request user input for UTM zone and hemisphere for precise transform:
-st.subheader("UTM Zone and Hemisphere")
-utm_zone = st.number_input("UTM Zone Number", min_value=1, max_value=60, value=32)
-hemisphere = st.selectbox("Hemisphere", options=["N", "S"], index=0)
-
-# Setup CRS strings
-if hemisphere == "N":
-    utm_crs = CRS.from_dict({"proj": "utm", "zone": utm_zone, "south": False})
-else:
-    utm_crs = CRS.from_dict({"proj": "utm", "zone": utm_zone, "south": True})
-
-wgs84_crs = CRS.from_epsg(4326)
-transformer_utm2wgs = Transformer.from_crs(utm_crs, wgs84_crs, always_xy=True)
-transformer_wgs2utm = Transformer.from_crs(wgs84_crs, utm_crs, always_xy=True)
-
-# --- Input fields with FIFA default sizes ---
+# --- FIFA field sizes ---
 field_length = st.number_input("Field Length (m)", min_value=90.0, max_value=120.0, value=105.0, step=0.1)
 field_width = st.number_input("Field Width (m)", min_value=45.0, max_value=90.0, value=68.0, step=0.1)
 lane_spacing = st.number_input("Lane Spacing for Mowing (m)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
@@ -83,13 +115,11 @@ def interp_line(pts, n=100):
     y = np.interp(query, distances, pts[:, 1])
     return np.column_stack((x, y))
 
-
 def center_circle(center, radius, n_points=100):
     angles = np.linspace(0, 2 * np.pi, n_points)
     x = center[0] + radius * np.cos(angles)
     y = center[1] + radius * np.sin(angles)
     return np.column_stack((x, y))
-
 
 def generate_mowing_waypoints(length, width, spacing):
     waypoints = []
@@ -102,7 +132,6 @@ def generate_mowing_waypoints(length, width, spacing):
         y_points = np.full_like(x_points, y)
         waypoints.append(np.column_stack((x_points, y_points)))
     return np.vstack(waypoints)
-
 
 def generate_line_marking_waypoints(field_length, field_width):
     waypoints = []
@@ -206,36 +235,27 @@ def generate_line_marking_waypoints(field_length, field_width):
 
     return np.vstack(waypoints)
 
-# --- Rotation correction ---
-
 def rotate_points(pts, angle_deg):
     theta = np.radians(angle_deg)
     R = np.array([[np.cos(theta), -np.sin(theta)],
                   [np.sin(theta),  np.cos(theta)]])
     return (R @ pts.T).T
 
-# --- Main logic ---
+# --- Main ---
+rotation_angle = st.number_input("Field Rotation Angle (degrees, CCW)", value=0.0, step=1.0)
 
 if st.button("Generate Waypoints and KML"):
 
-    # Generate local waypoints in meters relative to origin
     if operation == "Mowing Lanes":
         waypoints_local = generate_mowing_waypoints(field_length, field_width, lane_spacing)
     else:
         waypoints_local = generate_line_marking_waypoints(field_length, field_width)
 
-    # Correct orientation: rotate local waypoints by 90 degrees CCW if needed (adjust as per your field orientation)
-    # You can let user input rotation if necessary; default 0 here
-    rotation_angle = st.number_input("Field Rotation Angle (degrees, CCW)", value=0.0, step=1.0)
     waypoints_local_rot = rotate_points(waypoints_local, rotation_angle)
-
-    # Translate local points back to global UTM coordinates
     waypoints_global_utm = waypoints_local_rot + np.array([E0, N0])
-
-    # Convert UTM to lat/lon for KML export
     waypoints_latlon = np.array([transformer_utm2wgs.transform(pt[0], pt[1]) for pt in waypoints_global_utm])
 
-    # Plot local waypoints for preview
+    # Preview plot
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.plot(waypoints_local_rot[:, 0], waypoints_local_rot[:, 1], ".-", markersize=2)
     ax.set_aspect('equal')
@@ -245,7 +265,7 @@ if st.button("Generate Waypoints and KML"):
     ax.grid(True)
     st.pyplot(fig)
 
-    # Create KML file
+    # Generate KML
     kml = simplekml.Kml()
     for i, (lon, lat) in enumerate(waypoints_latlon):
         kml.newpoint(name=str(i + 1), coords=[(lon, lat)])
