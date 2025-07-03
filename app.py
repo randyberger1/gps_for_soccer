@@ -3,10 +3,9 @@ import folium
 from streamlit_folium import st_folium
 import simplekml
 import io
-from shapely.geometry import Polygon, LineString, Point
-import math
+from shapely.geometry import Polygon, LineString
 
-# Default grass field boundary coords (lat, lon)
+# Default field boundary coords
 DEFAULT_FIELD = [
     (43.699047, 27.840622),
     (43.699011, 27.841512),
@@ -14,101 +13,76 @@ DEFAULT_FIELD = [
     (43.699999, 27.840693),
 ]
 
-def generate_grass_cutting_waypoints(boundary, mower_width):
-    # Simplified: generate parallel lines inside polygon boundary spaced by mower width
-    poly = Polygon([(lon, lat) for lat, lon in boundary])  # note lon, lat for shapely
+def generate_lines(boundary, mower_width):
+    poly = Polygon([(lon, lat) for lat, lon in boundary])
     minx, miny, maxx, maxy = poly.bounds
     lines = []
     y = miny
     while y <= maxy:
         line = LineString([(minx, y), (maxx, y)])
-        intersect = line.intersection(poly)
-        if intersect.is_empty:
+        inter = line.intersection(poly)
+        if inter.is_empty:
             y += mower_width
             continue
-        if intersect.geom_type == 'MultiLineString':
-            for segment in intersect.geoms:
-                lines.append(segment)
-        elif intersect.geom_type == 'LineString':
-            lines.append(intersect)
+        if inter.geom_type == "MultiLineString":
+            lines.extend(inter.geoms)
+        elif inter.geom_type == "LineString":
+            lines.append(inter)
         y += mower_width
     return lines
 
-def generate_lawn_striping_waypoints(boundary, mower_width, pattern):
-    # For demo, basic stripe pattern same as grass cutting
-    # Could extend to checkerboard or diagonal by rotating field / lines
-    return generate_grass_cutting_waypoints(boundary, mower_width)
+def create_map(boundary, lines):
+    avg_lat = sum([pt[0] for pt in boundary]) / len(boundary)
+    avg_lon = sum([pt[1] for pt in boundary]) / len(boundary)
+    m = folium.Map(location=[avg_lat, avg_lon], zoom_start=18)
+    folium.Polygon(locations=boundary, color="green", fill=True, fill_opacity=0.1).add_to(m)
+    for line in lines:
+        folium.PolyLine(locations=[(pt[1], pt[0]) for pt in line.coords], color="blue").add_to(m)
+    return m
 
-def generate_pitch_marking_waypoints(boundary):
-    # Very simplified: just the outer field rectangle for now
-    # Replace with full FIFA pitch drawing logic if needed
-    return [LineString([(lon, lat) for lat, lon in boundary])]
-
-def create_kml_bytes(lines):
+def create_kml(lines):
     kml = simplekml.Kml()
     for line in lines:
-        coords = [(pt[0], pt[1]) for pt in list(line.coords)]  # (lon, lat)
-        kml.newlinestring(name="WaypointPath", coords=coords)
-    kml_str = kml.kml()  # get KML as string
-    kml_bytes = io.BytesIO(kml_str.encode('utf-8'))  # encode string to bytes
-    kml_bytes.seek(0)
-    return kml_bytes
+        coords = [(pt[0], pt[1]) for pt in line.coords]
+        kml.newlinestring(coords=coords)
+    kml_str = kml.kml()
+    bio = io.BytesIO(kml_str.encode("utf-8"))
+    bio.seek(0)
+    return bio
 
-def main():
-    st.title("Football Field Robot Guidance Line Generator")
+st.title("Football Field Waypoint Generator")
 
-    st.markdown("Input field boundary coordinates (lat, lon) one per line, comma-separated:")
-    coords_text = st.text_area(
-        "Field Boundary Coordinates",
-        value="\n".join([f"{lat}, {lon}" for lat, lon in DEFAULT_FIELD]),
-        height=100,
-    )
-    
-    mower_width = st.number_input("Mower / Roller Operating Width (meters)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
-    task = st.selectbox("Select Task", ["Grass Cutting", "Lawn Striping", "Pitch Marking"])
+coords_text = st.text_area(
+    "Field Boundary Coordinates (lat, lon)", 
+    "\n".join(f"{lat}, {lon}" for lat, lon in DEFAULT_FIELD), 
+    height=100,
+)
 
-    if st.button("Generate Waypoints"):
-        # Parse coordinates
-        try:
-            boundary = []
-            for line in coords_text.strip().split("\n"):
-                lat_str, lon_str = line.strip().split(",")
-                lat = float(lat_str)
-                lon = float(lon_str)
-                boundary.append((lat, lon))
-            if len(boundary) < 3:
-                st.error("Please enter at least 3 boundary points.")
-                return
-        except Exception as e:
-            st.error(f"Invalid coordinate format: {e}")
-            return
+mower_width = st.number_input("Mower Width (meters)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
 
-        # Generate waypoints based on task
-        if task == "Grass Cutting":
-            lines = generate_grass_cutting_waypoints(boundary, mower_width)
-        elif task == "Lawn Striping":
-            lines = generate_lawn_striping_waypoints(boundary, mower_width, pattern="basic")
-        else:
-            lines = generate_pitch_marking_waypoints(boundary)
+if st.button("Generate"):
+    # Parse coords safely
+    try:
+        boundary = []
+        for line in coords_text.strip().split("\n"):
+            lat, lon = map(float, line.split(","))
+            boundary.append((lat, lon))
+        if len(boundary) < 3:
+            st.error("Please enter at least 3 points.")
+            st.stop()
+    except Exception as e:
+        st.error(f"Invalid coordinate format: {e}")
+        st.stop()
 
-        # Create folium map centered on average point
-        avg_lat = sum([pt[0] for pt in boundary]) / len(boundary)
-        avg_lon = sum([pt[1] for pt in boundary]) / len(boundary)
-        m = folium.Map(location=[avg_lat, avg_lon], zoom_start=18)
+    lines = generate_lines(boundary, mower_width)
 
-        # Draw field boundary polygon
-        folium.Polygon(locations=boundary, color="green", weight=3, fill=True, fill_opacity=0.1).add_to(m)
+    # Save results in session state to persist after reruns
+    st.session_state['boundary'] = boundary
+    st.session_state['lines'] = lines
 
-        # Draw waypoint lines
-        for line in lines:
-            locs = [(pt[1], pt[0]) for pt in line.coords]  # folium expects (lat, lon)
-            folium.PolyLine(locations=locs, color="blue", weight=2).add_to(m)
+if "boundary" in st.session_state and "lines" in st.session_state:
+    m = create_map(st.session_state['boundary'], st.session_state['lines'])
+    st_folium(m, width=700, height=500)
 
-        st_folium(m, width=700, height=500)
-
-        # Export KML
-        kml_bytes = create_kml_bytes(lines)
-        st.download_button("Download KML file", kml_bytes, file_name="waypoints.kml", mime="application/vnd.google-earth.kml+xml")
-
-if __name__ == "__main__":
-    main()
+    kml_bytes = create_kml(st.session_state['lines'])
+    st.download_button("Download KML", kml_bytes, "waypoints.kml", "application/vnd.google-earth.kml+xml")
