@@ -1,6 +1,5 @@
 streamlit
-numpy
-pandas
-matplotlib
-simplekml
+shapely
+geopandas
 pyproj
+simplekml
