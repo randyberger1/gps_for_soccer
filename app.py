@@ -7,10 +7,14 @@ def generate_headland_passes(field_boundary, operating_width, num_headland_passe
     Generates headland passes around the outer boundary of the field.
     These will be parallel to the field's boundary and will be offset by the mower's width.
     """
+    # Convert the polygon boundary to a LineString (the exterior boundary)
+    field_boundary_line = field_boundary.exterior
+    
     headland_passes = []
     for i in range(num_headland_passes):
         offset_distance = operating_width * i  # Offset distance for each pass
-        headland_pass = field_boundary.parallel_offset(offset_distance, side='left')
+        # Create a parallel offset to the boundary line
+        headland_pass = field_boundary_line.parallel_offset(offset_distance, side='left')
         headland_passes.append(headland_pass)
     return headland_passes
 
