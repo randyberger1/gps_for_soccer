@@ -1,62 +1,3 @@
-import streamlit as st
-import folium
-from streamlit_folium import st_folium
-from geopy.distance import geodesic
-import numpy as np
-
-# Utility: parse coordinates from multiline text input
-def parse_coords(text):
-    coords = []
-    for line in text.strip().split("\n"):
-        if not line.strip():
-            continue
-        try:
-            lat, lon = map(float, line.strip().split(","))
-            coords.append((lat, lon))
-        except Exception:
-            st.error(f"Invalid coordinate line: {line}")
-            return None
-    return coords
-
-# Calculate length (longest side) and width (max perpendicular distance)
-def polygon_dimensions(coords):
-    # Longest distance between any two points (length)
-    max_dist = 0
-    pt1 = pt2 = None
-    for i in range(len(coords)):
-        for j in range(i+1, len(coords)):
-            d = geodesic(coords[i], coords[j]).meters
-            if d > max_dist:
-                max_dist = d
-                pt1, pt2 = coords[i], coords[j]
-
-    # Convert lat/lon to local Cartesian approx (meters)
-    def to_xy(latlon):
-        lat0, lon0 = pt1
-        R = 6371000  # Earth radius in meters
-        x = R * np.radians(latlon[1] - lon0) * np.cos(np.radians(lat0))
-        y = R * np.radians(latlon[0] - lat0)
-        return np.array([x, y])
-
-    p1 = to_xy(pt1)
-    p2 = to_xy(pt2)
-    line_vec = p2 - p1
-    line_len = np.linalg.norm(line_vec)
-    line_unitvec = line_vec / line_len
-
-    def point_line_dist(point):
-        p = to_xy(point)
-        vec = p - p1
-        proj_len = np.dot(vec, line_unitvec)
-        proj_point = p1 + proj_len * line_unitvec
-        dist_vec = p - proj_point
-        return np.linalg.norm(dist_vec)
-
-    widths = [point_line_dist(pt) for pt in coords]
-    max_width = max(widths)
-
-    return max_dist, max_width
-
 def main():
     st.title("Football Field Boundary and Validation")
 
@@ -105,10 +46,21 @@ def main():
         else:
             st.error("Field dimensions do NOT comply with FIFA standards.")
 
+    # --- New Inputs for mower width, direction, and headland passes ---
+
+    st.subheader("Mowing Parameters")
+
+    mower_width = st.number_input("Mower Operating Width (meters)", min_value=0.5, max_value=10.0, value=2.0, step=0.1)
+
+    driving_direction = st.radio(
+        "Driving Direction",
+        options=["Parallel to Longest Side", "Perpendicular to Longest Side"],
+        index=0,
+    )
+
+    headland_passes = st.number_input("Number of Headland Passes", min_value=0, max_value=5, value=2, step=1)
+
     # Show map with polygon
     m = folium.Map(location=st.session_state.field_coords[0], zoom_start=18)
     folium.Polygon(locations=st.session_state.field_coords, color="green", fill=True, fill_opacity=0.3).add_to(m)
     st_folium(m, width=700, height=500)
-
-if __name__ == "__main__":
-    main()
