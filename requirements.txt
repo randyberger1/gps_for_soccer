@@ -3,3 +3,4 @@ shapely
 geopandas
 pyproj
 simplekml
+folium
