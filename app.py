@@ -82,7 +82,7 @@ def main():
     if st.button("Generate Waypoints"):
         waypoints = generate_waypoints(field_coords, mower_width)
 
-        m = folium.Map(location=field_coords[0], zoom_start=18)
+        m = folium.Map(location=field_coords[0], zoom_start=18, tiles=None)  # No base tiles for blank field
         folium.Polygon(locations=field_coords, color="green", fill=True, fill_opacity=0.2).add_to(m)
         for line in waypoints:
             folium.PolyLine(line, color="blue", weight=3).add_to(m)
