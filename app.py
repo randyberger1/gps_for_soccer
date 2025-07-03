@@ -1,143 +1,176 @@
 import streamlit as st
 import folium
+from folium import Map, PolyLine, Polygon as FoliumPolygon
 from streamlit_folium import st_folium
+from shapely.geometry import Polygon, LineString
+from shapely.affinity import rotate
+import numpy as np
 from io import BytesIO
+import simplekml
 
-st.set_page_config(page_title="Football Field Waypoints Generator", layout="wide")
+st.set_page_config(layout="wide")
 
-st.title("Football Grass Field Waypoints Generator")
+def find_longest_edge(polygon: Polygon):
+    coords = list(polygon.exterior.coords)
+    max_len = 0
+    longest_segment = None
+    for i in range(len(coords)-1):
+        p1 = np.array(coords[i])
+        p2 = np.array(coords[i+1])
+        dist = np.linalg.norm(p2 - p1)
+        if dist > max_len:
+            max_len = dist
+            longest_segment = (p1, p2)
+    return longest_segment
 
-# Default boundary coordinates (lat, lon)
-DEFAULT_BOUNDARY = [
-    (43.699047, 27.840622),
-    (43.699011, 27.841512),
-    (43.699956, 27.841568),
-    (43.699999, 27.840693),
-]
+def angle_of_segment(p1, p2):
+    delta = p2 - p1
+    angle_rad = np.arctan2(delta[1], delta[0])
+    return np.degrees(angle_rad)
 
-# Utility: generate waypoints by simple parallel lines for demo
-def generate_waypoints(boundary, mower_width, task):
-    # For simplicity: generate parallel lines between min/max lat with spacing = mower_width meters approx in lat degrees
-    # 1 meter ~ 0.000009 degrees latitude (approx)
-    spacing_deg = mower_width * 0.000009
-    lats = [p[0] for p in boundary]
-    lons = [p[1] for p in boundary]
+def generate_parallel_lines(polygon: Polygon, line_width_m: float, angle_deg: float):
+    # Approximate meters to degrees latitude (~0.000009 deg per meter)
+    spacing_deg = line_width_m * 0.000009
 
-    min_lat, max_lat = min(lats), max(lats)
-    min_lon, max_lon = min(lons), max(lons)
+    # Rotate polygon so lines are horizontal (0 deg)
+    rotated = rotate(polygon, -angle_deg, origin='centroid', use_radians=False)
+    minx, miny, maxx, maxy = rotated.bounds
 
     lines = []
-    current_lat = min_lat
-
-    while current_lat <= max_lat:
-        # Create line at this latitude between min_lon and max_lon
-        line = [(current_lat, min_lon), (current_lat, max_lon)]
-        lines.append(line)
-        current_lat += spacing_deg
-
-    # For pitch marking task, add rectangle outline as a single polygon line (for demo)
-    if task == "pitch marking":
-        lines = [boundary]  # Just the boundary polygon line
-
+    y = miny
+    while y <= maxy:
+        base_line = LineString([(minx, y), (maxx, y)])
+        # Rotate line back to original orientation
+        rotated_line = rotate(base_line, angle_deg, origin='centroid', use_radians=False)
+        clipped = rotated_line.intersection(polygon)
+        if clipped.is_empty:
+            y += spacing_deg
+            continue
+        if clipped.geom_type == "MultiLineString":
+            for segment in clipped.geoms:
+                lines.append(list(segment.coords))
+        elif clipped.geom_type == "LineString":
+            lines.append(list(clipped.coords))
+        y += spacing_deg
     return lines
 
-# Export KML file content from waypoint lines
-def export_kml(waypoint_lines):
-    kml_header = '''<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2">
-<Document>'''
-    kml_footer = "</Document></kml>"
+def lines_to_kml(lines, kml_filename="waypoints.kml"):
+    kml = simplekml.Kml()
+    for idx, line in enumerate(lines):
+        ls = kml.newlinestring(name=f"Line {idx+1}", coords=line)
+        ls.style.linestyle.color = simplekml.Color.red
+        ls.style.linestyle.width = 3
+    kml_bytes = kml.kml()
+    return kml_bytes
 
-    placemarks = ""
-    for i, line in enumerate(waypoint_lines):
-        coords_str = " ".join([f"{lon},{lat},0" for lat, lon in line])
-        placemark = f"""
-    <Placemark>
-      <name>Line {i+1}</name>
-      <LineString>
-        <coordinates>{coords_str}</coordinates>
-      </LineString>
-    </Placemark>"""
-        placemarks += placemark
+def create_map(boundary, lines, show=True):
+    if not show:
+        return None
+    center_lat = np.mean([pt[0] for pt in boundary])
+    center_lon = np.mean([pt[1] for pt in boundary])
+    m = Map(location=[center_lat, center_lon], zoom_start=17)
 
-    return kml_header + placemarks + kml_footer
+    # Draw polygon
+    FoliumPolygon(locations=boundary, color="green", fill=True, fill_opacity=0.3, weight=3).add_to(m)
 
+    # Draw lines
+    for line in lines:
+        FoliumPolyline = PolyLine(locations=line, color="blue", weight=2)
+        FoliumPolyline.add_to(m)
 
-# --- Streamlit UI ---
+    return m
 
-with st.sidebar:
-    st.header("Input Parameters")
+def main():
+    st.title("Football Grass Field Waypoint Generator")
 
-    # Boundary input as multiline text box
-    boundary_text = st.text_area(
-        "Grass Field Boundary Coordinates (lat, lon per line, comma-separated):",
-        value="\n".join([f"{lat},{lon}" for lat, lon in DEFAULT_BOUNDARY]),
-        height=150,
+    st.markdown("""
+    Input the grass field boundary as a list of latitude,longitude points (non-rectangular allowed).
+    Select mower operating width and driving course pattern.
+    Generate waypoints and optionally show them on the map.
+    Export waypoints as a KML file for robot navigation.
+    """)
+
+    default_boundary = [
+        (43.699047, 27.840622),
+        (43.699011, 27.841512),
+        (43.699956, 27.841568),
+        (43.699999, 27.840693),
+        (43.699800, 27.840500),  # added extra points to simulate a polygon with >4 points
+        (43.699500, 27.840400),
+        (43.699200, 27.840450),
+        (43.699000, 27.840500)
+    ]
+
+    boundary_input = st.text_area(
+        "Enter polygon vertices as lat,lon per line",
+        value="\n".join([f"{lat},{lon}" for lat, lon in default_boundary]),
+        height=150
     )
 
-    # Parse boundary input
-    boundary = []
-    for line in boundary_text.strip().split("\n"):
-        parts = line.strip().split(",")
-        if len(parts) == 2:
-            try:
-                lat = float(parts[0].strip())
-                lon = float(parts[1].strip())
-                boundary.append((lat, lon))
-            except ValueError:
-                pass
+    try:
+        boundary = []
+        for line in boundary_input.strip().split("\n"):
+            lat_str, lon_str = line.strip().split(",")
+            boundary.append((float(lat_str), float(lon_str)))
+        if len(boundary) < 3:
+            st.error("Please enter at least 3 vertices.")
+            return
+    except Exception as e:
+        st.error(f"Error parsing coordinates: {e}")
+        return
 
-    mower_width = st.number_input(
-        "Mower Operating Width (meters)", min_value=0.1, max_value=10.0, value=1.0, step=0.1
+    mower_width = st.number_input("Mower operating width (meters)", min_value=0.5, max_value=10.0, value=2.0, step=0.1)
+
+    course_type = st.selectbox(
+        "Driving Course Pattern",
+        options=["parallel to longest side", "perpendicular to longest side", "checkerboard", "diagonal"]
     )
 
-    task = st.selectbox(
-        "Select Task",
-        options=["grass cutting", "striping", "pitch marking"],
-        index=0,
-    )
+    show_map = st.checkbox("Show map visualization", value=True)
 
-    generate = st.button("Generate Waypoints")
+    if st.button("Generate Waypoints"):
+        polygon = Polygon(boundary)
+        longest_seg = find_longest_edge(polygon)
+        p1, p2 = longest_seg
+        longest_angle = angle_of_segment(p1, p2)
 
-if generate:
-    if len(boundary) < 3:
-        st.error("Please provide at least 3 valid boundary coordinates.")
-    else:
-        waypoints_list = generate_waypoints(boundary, mower_width, task)
-        st.session_state["waypoints_list"] = waypoints_list
-        st.session_state["boundary_latlon"] = boundary
+        st.write(f"Longest side angle: {longest_angle:.2f} degrees")
 
-if "waypoints_list" in st.session_state and "boundary_latlon" in st.session_state:
-    waypoints_list = st.session_state["waypoints_list"]
-    boundary_latlon = st.session_state["boundary_latlon"]
+        if course_type == "parallel to longest side":
+            lines = generate_parallel_lines(polygon, mower_width, longest_angle)
+        elif course_type == "perpendicular to longest side":
+            perp_angle = (longest_angle + 90) % 360
+            lines = generate_parallel_lines(polygon, mower_width, perp_angle)
+        elif course_type == "checkerboard":
+            lines1 = generate_parallel_lines(polygon, mower_width, longest_angle)
+            perp_angle = (longest_angle + 90) % 360
+            lines2 = generate_parallel_lines(polygon, mower_width, perp_angle)
+            lines = lines1 + lines2
+        elif course_type == "diagonal":
+            if len(boundary) >= 3:
+                diag_angle = angle_of_segment(np.array(boundary[0]), np.array(boundary[2]))
+                lines = generate_parallel_lines(polygon, mower_width, diag_angle)
+            else:
+                lines = []
+        else:
+            lines = []
 
-    show_map = st.checkbox("Show Map Visualization", value=True)
+        st.success(f"Generated {len(lines)} waypoint lines.")
 
-    if show_map:
-        st.markdown("### Select which waypoint lines to display:")
-        show_lines = []
-        for i in range(len(waypoints_list)):
-            show = st.checkbox(f"Line {i+1}", value=True, key=f"line_{i}")
-            show_lines.append(show)
+        kml_bytes = lines_to_kml(lines)
 
-        m = folium.Map(location=boundary_latlon[0], zoom_start=18)
-        folium.Polygon(locations=boundary_latlon, color="green", weight=3, fill=False).add_to(m)
+        st.download_button(
+            label="Download KML file",
+            data=kml_bytes,
+            file_name="waypoints.kml",
+            mime="application/vnd.google-earth.kml+xml"
+        )
 
-        colors = ["red", "blue", "white", "yellow", "cyan"]
-        for i, line in enumerate(waypoints_list):
-            if show_lines[i]:
-                folium.PolyLine(locations=line, color=colors[i % len(colors)], weight=2).add_to(m)
+        if show_map:
+            m = create_map(boundary, lines, show=True)
+            st_data = st_folium(m, width=700, height=500)
+        else:
+            st.info("Map visualization is disabled.")
 
-        st_folium(m, width=700, height=500)
-    else:
-        st.info("Map visualization is hidden. You can enable it by checking 'Show Map Visualization'.")
-
-    # KML Download button
-    kml_data = export_kml(waypoints_list)
-    kml_bytes = kml_data.encode("utf-8")
-    st.download_button(
-        label="Download Waypoints as KML (all lines)",
-        data=kml_bytes,
-        file_name="waypoints.kml",
-        mime="application/vnd.google-earth.kml+xml",
-    )
+if __name__ == "__main__":
+    main()
