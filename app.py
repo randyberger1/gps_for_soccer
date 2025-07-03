@@ -1,171 +1,172 @@
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
-from shapely.geometry import Polygon, LineString, Point
-from shapely.affinity import translate, rotate
+from shapely.geometry import Polygon, LineString
 import simplekml
-
+import io
 import math
 
-# Default field boundary coordinates (lat, lon)
+# Default grass field boundary coords (lat, lon)
 DEFAULT_FIELD = [
     (43.699047, 27.840622),
     (43.699011, 27.841512),
     (43.699956, 27.841568),
-    (43.699999, 27.840693)
+    (43.699999, 27.840693),
 ]
 
 def parse_coords(text):
-    """Parse input coordinates from multiline text into list of (lat, lon)."""
     coords = []
     for line in text.strip().split("\n"):
+        if not line.strip():
+            continue
         parts = line.split(",")
-        if len(parts) == 2:
-            try:
-                lat = float(parts[0].strip())
-                lon = float(parts[1].strip())
-                coords.append((lat, lon))
-            except:
-                pass
+        if len(parts) != 2:
+            continue
+        try:
+            lat = float(parts[0].strip())
+            lon = float(parts[1].strip())
+            coords.append((lat, lon))
+        except:
+            pass
     return coords
 
 def generate_parallel_passes(polygon, width, angle=0):
     """
-    Generate parallel lines inside polygon with spacing = width.
-    angle in degrees defines driving direction.
-    Returns list of LineString waypoints (paths).
+    Generate simple parallel lines (LineStrings) inside polygon at given angle and spacing (width).
+    Simplified: just generate lines bounding polygon bbox, then clip with polygon.
     """
-    # Rotate polygon to align with driving direction
-    rotated_poly = rotate(polygon, -angle, origin='centroid', use_radians=False)
-    minx, miny, maxx, maxy = rotated_poly.bounds
+    minx, miny, maxx, maxy = polygon.bounds
+    # Create lines along the longer dimension depending on angle
+    # We will generate lines spaced by width along the bbox width/height
 
     lines = []
-    y = miny + width/2
-    while y < maxy:
-        line = LineString([(minx, y), (maxx, y)])
-        # intersect with polygon to cut line
-        intersected = line.intersection(rotated_poly)
-        if not intersected.is_empty:
-            # Could be MultiLineString if multiple parts
-            if intersected.geom_type == 'MultiLineString':
-                for segment in intersected:
-                    lines.append(segment)
-            elif intersected.geom_type == 'LineString':
-                lines.append(intersected)
-        y += width
+    # Angle in degrees, convert to radians
+    rad = math.radians(angle)
+    cos_a = math.cos(rad)
+    sin_a = math.sin(rad)
 
-    # Rotate lines back
-    final_lines = [rotate(line, angle, origin=polygon.centroid, use_radians=False) for line in lines]
-    return final_lines
+    # Compute bounding box diagonal length to cover polygon fully
+    diag = math.hypot(maxx - minx, maxy - miny)
+
+    # We'll generate lines perpendicular to angle direction, spaced by width
+    # Start from a point outside bounding box and move across
+
+    # Project bounding box corners onto axis perpendicular to angle
+    def proj(x, y):
+        return -sin_a * x + cos_a * y
+
+    min_p = min(proj(x, y) for x, y in [(minx, miny), (minx, maxy), (maxx, miny), (maxx, maxy)])
+    max_p = max(proj(x, y) for x, y in [(minx, miny), (minx, maxy), (maxx, miny), (maxx, maxy)])
+
+    current_p = min_p - width * 2
+    while current_p <= max_p + width * 2:
+        # For each line, we solve for two points far along the line in the rotated space
+        # Line formula param: x(t), y(t) = base + t * (cos_a, sin_a)
+        # Here, base point is on the line at offset current_p along perpendicular axis
+
+        # Base point at (x0,y0)
+        x0 = cos_a * current_p
+        y0 = sin_a * current_p
+
+        # Generate long segment along direction
+        line_pts = []
+        # t ranges large enough to cover bbox
+        for t in [-diag * 2, diag * 2]:
+            # Solve x,y from perpendicular projection
+            # We want points along line perpendicular axis = current_p
+            # Actually, here line is parameterized as:
+            # x = t * cos_a + x0
+            # y = t * sin_a + y0
+            x = t * cos_a + x0
+            y = t * sin_a + y0
+            line_pts.append((x, y))
+
+        line = LineString(line_pts)
+        # Clip line with polygon
+        clipped = line.intersection(polygon)
+        if clipped.is_empty:
+            current_p += width
+            continue
+        if clipped.geom_type == "MultiLineString":
+            lines.extend(clipped.geoms)
+        elif clipped.geom_type == "LineString":
+            lines.append(clipped)
+        current_p += width
+
+    return lines
 
 def generate_pitch_marking(polygon):
     """
-    Generate fixed FIFA pitch marking waypoints based on polygon centroid.
-    This is simplified and assumes rectangle approx.
-    Returns list of LineStrings and Points (for arcs etc).
+    Very simplified: just draw outer rectangle polygon as pitch marking.
     """
-    # Extract centroid and approximate pitch rectangle based on polygon bounds
-    # Using FIFA standard: 105x68 meters (approx convert to degrees)
-    # For demo, we just create rectangular lines inside polygon bounds
-    minx, miny, maxx, maxy = polygon.bounds
+    # Just return the polygon exterior as one line for demonstration
+    return [LineString(polygon.exterior.coords)]
 
-    # You'd need real geodetic calculation or a projected system here
-    # For simplicity, just use bounds
-
-    pitch_lines = []
-
-    # Outer rectangle (pitch boundary)
-    pitch_lines.append(LineString([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy), (minx, miny)]))
-
-    # Center line
-    pitch_lines.append(LineString([(minx + (maxx - minx)/2, miny), (minx + (maxx - minx)/2, maxy)]))
-
-    # Center circle (approximate with points)
-    # For simplicity, we won’t draw arcs here, just points
-
-    return pitch_lines
-
-def create_kml(lines, filename="waypoints.kml"):
+def create_kml_bytes(lines):
     kml = simplekml.Kml()
     for line in lines:
-        coords = [(pt[0], pt[1]) for pt in list(line.coords)]
-        kml.newlinestring(name="Path", coords=coords)
-    kml.save(filename)
+        coords = [(pt[0], pt[1]) for pt in list(line.coords)]  # (lon, lat)
+        # simplekml expects (lon, lat)
+        kml.newlinestring(name="WaypointPath", coords=coords)
+    kml_bytes = io.BytesIO()
+    kml.save(kml_bytes)
+    kml_bytes.seek(0)
+    return kml_bytes
 
 def main():
-    st.title("Football Field Robotics Waypoints Generator")
+    st.title("Football Field Waypoints Generator")
 
-    st.markdown("Input the grass field boundary coordinates (lat, lon), one per line:")
+    coords_text = st.text_area(
+        "Enter grass field boundary coordinates (lat, lon), one per line:",
+        value="\n".join([f"{lat}, {lon}" for lat, lon in DEFAULT_FIELD]),
+        height=150,
+    )
+    coords = parse_coords(coords_text)
 
-    input_coords_text = st.text_area("Field boundary coordinates", 
-                                    value="\n".join([f"{lat}, {lon}" for lat, lon in DEFAULT_FIELD]), height=150)
-    
-    coords = parse_coords(input_coords_text)
     if len(coords) < 3:
-        st.error("Please input at least 3 coordinates for the field boundary polygon.")
+        st.warning("Please input at least 3 valid coordinates for the polygon.")
         return
 
-    polygon = Polygon([(lon, lat) for lat, lon in coords])  # shapely uses (x,y) = (lon, lat)
+    polygon = Polygon([(lon, lat) for lat, lon in coords])  # Note shapely x=lon, y=lat
 
-    mower_width = st.number_input("Mower operating width (meters)", min_value=0.5, max_value=10.0, value=1.0, step=0.1)
+    mower_width = st.number_input("Mower Operating Width (meters)", min_value=0.5, max_value=10.0, value=1.0, step=0.1)
 
-    task = st.selectbox("Select task", ["Grass Cutting", "Striping", "Pitch Marking"])
+    task = st.selectbox("Select Task", ["Grass Cutting", "Striping", "Pitch Marking"])
 
     striping_pattern = None
     if task == "Striping":
-        striping_pattern = st.selectbox("Select striping pattern", ["Basic Stripes", "Checkerboard", "Diagonal"])
+        striping_pattern = st.selectbox("Select Striping Pattern", ["Basic Stripes", "Checkerboard", "Diagonal"])
 
-    generate_button = st.button("Generate Waypoints")
-
-    if generate_button:
-        m = folium.Map(location=[coords[0][0], coords[0][1]], zoom_start=18)
-
-        if task in ["Grass Cutting", "Striping"]:
-            angle = 0
-            if task == "Striping" and striping_pattern == "Checkerboard":
-                # For checkerboard, generate two passes with 0 and 90 degrees and merge
-                lines1 = generate_parallel_passes(polygon, mower_width, angle=0)
-                lines2 = generate_parallel_passes(polygon, mower_width, angle=90)
-                lines = lines1 + lines2
-            elif task == "Striping" and striping_pattern == "Diagonal":
-                lines = generate_parallel_passes(polygon, mower_width, angle=45)
-            else:
-                # Basic stripes or Grass Cutting same direction
+    if st.button("Generate Waypoints"):
+        # Generate waypoints lines based on task
+        lines = []
+        if task == "Grass Cutting":
+            lines = generate_parallel_passes(polygon, mower_width, angle=0)
+        elif task == "Striping":
+            if striping_pattern == "Basic Stripes":
                 lines = generate_parallel_passes(polygon, mower_width, angle=0)
-
-            # Add polygon boundary
-            folium.Polygon(locations=coords, color="green", fill=False).add_to(m)
-
-            # Plot lines
-            for line in lines:
-                line_coords = [(pt[1], pt[0]) for pt in list(line.coords)]  # folium uses (lat, lon)
-                folium.PolyLine(line_coords, color="blue", weight=2).add_to(m)
-
-            # Save KML file
-            create_kml(lines, "waypoints.kml")
-            st.success("Waypoints generated! You can download the KML file below.")
-
-            with open("waypoints.kml", "rb") as f:
-                st.download_button("Download KML", f, "waypoints.kml")
-
-            st_folium(m, width=700, height=500)
-
+            elif striping_pattern == "Checkerboard":
+                lines = generate_parallel_passes(polygon, mower_width, angle=0) + generate_parallel_passes(polygon, mower_width, angle=90)
+            elif striping_pattern == "Diagonal":
+                lines = generate_parallel_passes(polygon, mower_width, angle=45)
         elif task == "Pitch Marking":
             lines = generate_pitch_marking(polygon)
-            folium.Polygon(locations=coords, color="green", fill=False).add_to(m)
 
-            for line in lines:
-                line_coords = [(pt[1], pt[0]) for pt in list(line.coords)]
-                folium.PolyLine(line_coords, color="white", weight=3).add_to(m)
+        # Show map
+        m = folium.Map(location=[coords[0][0], coords[0][1]], zoom_start=18)
+        folium.Polygon(locations=coords, color="green", fill=False, weight=3).add_to(m)
 
-            # Save KML
-            create_kml(lines, "pitch_marking.kml")
-            st.success("Pitch marking generated! Download KML below.")
+        for line in lines:
+            # line.coords are (x=lon, y=lat)
+            line_latlon = [(pt[1], pt[0]) for pt in list(line.coords)]
+            color = "blue" if task != "Pitch Marking" else "white"
+            folium.PolyLine(line_latlon, color=color, weight=3).add_to(m)
 
-            with open("pitch_marking.kml", "rb") as f:
-                st.download_button("Download KML", f, "pitch_marking.kml")
+        st_folium(m, width=700, height=500)
 
-            st_folium(m, width=700, height=500)
+        # Create KML for download
+        kml_bytes = create_kml_bytes(lines)
+        st.download_button("Download KML", kml_bytes, file_name="waypoints.kml", mime="application/vnd.google-earth.kml+xml")
 
 if __name__ == "__main__":
     main()
