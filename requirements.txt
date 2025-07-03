@@ -6,3 +6,6 @@ simplekml
 folium
 streamlit-folium
 geopy
+opencv-python
+numpy
+matplotlib
