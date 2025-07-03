@@ -5,3 +5,4 @@ pyproj
 simplekml
 folium
 streamlit-folium
+geopy
