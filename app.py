@@ -1,66 +1,56 @@
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
-from shapely.geometry import Polygon, LineString
 import numpy as np
 import simplekml
+from shapely.geometry import Polygon
+import pyproj  # Coordinate transformation for UTM
 
-def parse_coords(text):
-    coords = []
-    for line in text.strip().split('\n'):
-        parts = line.strip().split(',')
-        if len(parts) == 2:
-            try:
-                lat = float(parts[0].strip())
-                lon = float(parts[1].strip())
-                coords.append((lat, lon))
-            except:
-                continue
-    return coords
+# Function to convert lat/lon to UTM
+def latlon_to_utm(lat, lon):
+    wgs84 = pyproj.CRS("EPSG:4326")  # WGS84 (Lat/Lon)
+    utm = pyproj.CRS("EPSG:32633")  # UTM zone 33N
+    transformer = pyproj.Transformer.from_crs(wgs84, utm, always_xy=True)
+    return transformer.transform(lon, lat)
 
-def generate_waypoints(field_coords, mower_width):
-    polygon = Polygon([(lon, lat) for lat, lon in field_coords])
-    coords = list(polygon.exterior.coords)
-    edges = [(np.linalg.norm(np.array(coords[i]) - np.array(coords[i-1])), (coords[i-1], coords[i])) for i in range(1, len(coords))]
-    longest_edge = max(edges, key=lambda x: x[0])[1]
-
-    dx = longest_edge[1][0] - longest_edge[0][0]
-    dy = longest_edge[1][1] - longest_edge[0][1]
-    angle = np.arctan2(dy, dx)
-
-    def rotate_point(x, y, ang):
-        return (x * np.cos(ang) + y * np.sin(ang), -x * np.sin(ang) + y * np.cos(ang))
-
-    rotated_coords = [rotate_point(x, y, -angle) for x, y in polygon.exterior.coords]
-    min_x = min(c[0] for c in rotated_coords)
-    max_x = max(c[0] for c in rotated_coords)
-    min_y = min(c[1] for c in rotated_coords)
-    max_y = max(c[1] for c in rotated_coords)
-
+# Function to generate parallel lines for mowing
+def generate_parallel_lines(polygon, mower_width, direction_angle=0, headland_passes=2):
+    """Generate parallel mowing lines inside polygon"""
+    minx, miny, maxx, maxy = polygon.bounds
     lines = []
-    x = min_x + mower_width / 2
-    while x < max_x:
-        line_points = []
-        y_vals = np.linspace(min_y, max_y, 500)
-        for y in y_vals:
-            rx = x * np.cos(angle) - y * np.sin(angle)
-            ry = x * np.sin(angle) + y * np.cos(angle)
-            line_points.append((rx, ry))
-
-        line = LineString(line_points)
-        clipped = line.intersection(polygon)
-
-        if not clipped.is_empty:
-            if clipped.geom_type == 'MultiLineString':
-                clipped = max(clipped, key=lambda l: l.length)
-            if clipped.geom_type == 'LineString':
-                lines.append([(lat, lon) for lon, lat in clipped.coords])
+    
+    # Convert direction angle to radians
+    angle_rad = np.radians(direction_angle)
+    
+    # Generate headland passes (parallel to the field boundary)
+    for i in range(headland_passes):
+        offset = i * mower_width
+        line = [(minx + offset, miny), (minx + offset, maxy)]
+        lines.append(line)
+    
+    # Generate mowing lines in the field area after headland passes
+    x = minx + mower_width / 2  # Start position for mowing
+    while x <= maxx:
+        line = [(x, miny), (x, maxy)]
+        lines.append(line)
         x += mower_width
+
     return lines
 
-def main():
-    st.title("Football Grass Field Waypoint Generator")
+# Function to create KML from generated lines
+def create_kml(lines, task_name):
+    kml = simplekml.Kml()
+    for idx, line in enumerate(lines):
+        ls = kml.newlinestring(name=f"{task_name} Line {idx + 1}", coords=[(lon, lat) for lat, lon in line])
+        ls.style.linestyle.color = simplekml.Color.blue if task_name == "Grass Cutting" else simplekml.Color.green
+        ls.style.linestyle.width = 3
+    return kml.kml().encode('utf-8')
 
+# Main app
+def main():
+    st.title("Football Field Grass Cutting and Striping Generator")
+
+    st.markdown("### Input Grass Field Boundary (lat, lon) Coordinates")
     default_coords = """43.555830, 27.826090
 43.555775, 27.826100
 43.555422, 27.826747
@@ -69,41 +59,54 @@ def main():
 43.556217, 27.827538
 43.556559, 27.826893
 43.556547, 27.826833"""
-    st.markdown("### Input grass field boundary coordinates (lat, lon):")
-    coords_text = st.text_area("Coordinates", value=default_coords, height=150)
-    field_coords = parse_coords(coords_text)
-
+    
+    coords_text = st.text_area("Enter coordinates (lat, lon), one per line:", value=default_coords, height=150)
+    field_coords = []
+    
+    # Parse the input coordinates
+    for line in coords_text.split("\n"):
+        try:
+            lat, lon = map(float, line.strip().split(","))
+            field_coords.append((lat, lon))
+        except ValueError:
+            continue
+    
+    # Validate coordinates
     if len(field_coords) < 3:
-        st.error("Need at least 3 coordinates to form a polygon.")
+        st.warning("Please enter at least 3 coordinates to form a polygon.")
         return
+    
+    # Convert lat/lon to UTM and create Polygon
+    polygon_coords = [latlon_to_utm(lat, lon) for lat, lon in field_coords]
+    polygon = Polygon(polygon_coords)
 
-    mower_width = st.slider("Mower Operating Width (m)", 0.5, 5.0, 2.0, 0.1)
+    st.markdown("### Operational Parameters")
+    mower_width = st.number_input("Grass Mower Operating Width (meters)", min_value=0.5, max_value=10.0, value=2.0, step=0.1)
+    headland_passes = st.number_input("Number of Headland Passes", min_value=1, max_value=5, value=2, step=1)
+    mowing_direction = st.number_input("Mowing Direction Angle (degrees)", min_value=0, max_value=360, value=0, step=5)
 
     if st.button("Generate Waypoints"):
-        waypoints = generate_waypoints(field_coords, mower_width)
-
-        m = folium.Map(location=field_coords[0], zoom_start=18, tiles=None)  # No base tiles for blank field
+        # Generate waypoints for grass cutting task
+        grass_lines = generate_parallel_lines(polygon, mower_width, direction_angle=mowing_direction, headland_passes=headland_passes)
+        
+        # Create the folium map for visualization
+        m = folium.Map(location=field_coords[0], zoom_start=18)
+        
+        # Add the field boundary as a polygon
         folium.Polygon(locations=field_coords, color="green", fill=True, fill_opacity=0.2).add_to(m)
-        for line in waypoints:
+
+        # Add mowing lines to the map
+        for line in grass_lines:
             folium.PolyLine(line, color="blue", weight=3).add_to(m)
 
+        # Display the map
         st_folium(m, width=700, height=500)
 
-        kml = simplekml.Kml()
-        for idx, line in enumerate(waypoints):
-            ls = kml.newlinestring(name=f"Line {idx+1}", coords=[(lon, lat) for lat, lon in line])
-            ls.style.linestyle.color = simplekml.Color.blue
-            ls.style.linestyle.width = 3
-
-        kml_str = kml.kml()
-        kml_bytes = kml_str.encode("utf-8")
-
-        st.download_button(
-            label="Download Waypoints KML",
-            data=kml_bytes,
-            file_name="waypoints.kml",
-            mime="application/vnd.google-earth.kml+xml"
-        )
+        # Create KML for grass cutting
+        grass_kml = create_kml(grass_lines, "Grass Cutting")
+        
+        # Provide KML download button
+        st.download_button("Download Grass Cutting KML", grass_kml, "grass_cutting.kml", "application/vnd.google-earth.kml+xml")
 
 if __name__ == "__main__":
     main()
