@@ -17,10 +17,9 @@ def parse_coords(text):
     return coords
 
 def main():
-    st.title("Football Field Visualization with Manual Coordinates Input")
+    st.title("Football Field with Polygon and Corner Points")
 
     if "field_coords" not in st.session_state:
-        # Default polygon coords
         st.session_state.field_coords = [
             (43.555830, 27.826090),
             (43.555775, 27.826100),
@@ -31,6 +30,13 @@ def main():
             (43.556559, 27.826893),
             (43.556547, 27.826833),
             (43.555830, 27.826090)  # closing polygon
+        ]
+
+    if "corner_points" not in st.session_state:
+        # Start empty or with example points inside polygon
+        st.session_state.corner_points = [
+            (43.556000, 27.826500),
+            (43.555600, 27.827000)
         ]
 
     st.subheader("Input Field Coordinates (lat, lon) one per line, comma separated:")
@@ -46,9 +52,28 @@ def main():
             st.session_state.field_coords = new_coords
             st.success("Polygon updated!")
 
-    # Draw map with current polygon
+    st.subheader("Input Corner Points (lat, lon) one per line, comma separated:")
+    corners_text = "\n".join(f"{lat}, {lon}" for lat, lon in st.session_state.corner_points)
+    corners_input = st.text_area("Corner Points", corners_text, height=150)
+
+    if st.button("Update Corner Points"):
+        new_corners = parse_coords(corners_input)
+        if new_corners is not None:
+            st.session_state.corner_points = new_corners
+            st.success("Corner points updated!")
+
+    # Draw map
     m = folium.Map(location=st.session_state.field_coords[0], zoom_start=18)
     folium.Polygon(locations=st.session_state.field_coords, color="green", fill=True, fill_opacity=0.3).add_to(m)
+
+    # Add corner markers in red
+    for idx, (lat, lon) in enumerate(st.session_state.corner_points):
+        folium.Marker(
+            location=(lat, lon),
+            popup=f"Corner {idx+1}",
+            icon=folium.Icon(color='red', icon='flag')
+        ).add_to(m)
+
     st_folium(m, width=700, height=500)
 
 if __name__ == "__main__":
