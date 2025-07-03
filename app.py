@@ -1,8 +1,6 @@
 import streamlit as st
-import folium
-from streamlit_folium import st_folium
-import numpy as np
 import simplekml
+import numpy as np
 from shapely.geometry import Polygon
 import pyproj  # Coordinate transformation for UTM
 
@@ -89,19 +87,6 @@ def main():
         # Generate waypoints for grass cutting task
         grass_lines = generate_parallel_lines(polygon, mower_width, direction_angle=mowing_direction, headland_passes=headland_passes)
         
-        # Create the folium map for visualization
-        m = folium.Map(location=field_coords[0], zoom_start=18)
-        
-        # Add the field boundary as a polygon
-        folium.Polygon(locations=field_coords, color="green", fill=True, fill_opacity=0.2).add_to(m)
-
-        # Add mowing lines to the map
-        for line in grass_lines:
-            folium.PolyLine(line, color="blue", weight=3).add_to(m)
-
-        # Display the map
-        st_folium(m, width=700, height=500)
-
         # Create KML for grass cutting
         grass_kml = create_kml(grass_lines, "Grass Cutting")
         
