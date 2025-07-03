@@ -1,176 +1,202 @@
 import streamlit as st
 import folium
-from folium import Map, PolyLine, Polygon as FoliumPolygon
 from streamlit_folium import st_folium
-from shapely.geometry import Polygon, LineString
-from shapely.affinity import rotate
-import numpy as np
-from io import BytesIO
+from shapely.geometry import Polygon, LineString, Point
+from shapely import affinity
+from shapely.ops import unary_union
+from pyproj import Transformer
 import simplekml
+import io
+import math
 
-st.set_page_config(layout="wide")
+# ---- Coordinate conversion setup ----
+# Use UTM zone 35N (adjust if your coords are elsewhere)
+to_utm = Transformer.from_crs("epsg:4326", "epsg:32635", always_xy=True)
+to_latlon = Transformer.from_crs("epsg:32635", "epsg:4326", always_xy=True)
 
-def find_longest_edge(polygon: Polygon):
-    coords = list(polygon.exterior.coords)
-    max_len = 0
-    longest_segment = None
-    for i in range(len(coords)-1):
-        p1 = np.array(coords[i])
-        p2 = np.array(coords[i+1])
-        dist = np.linalg.norm(p2 - p1)
-        if dist > max_len:
-            max_len = dist
-            longest_segment = (p1, p2)
-    return longest_segment
+# ---- Default boundary: 7 vertices polygon (stadium) ----
+DEFAULT_BOUNDARY_LATLON = [
+    (43.555830, 27.826090),
+    (43.555775, 27.826100),
+    (43.555422, 27.826747),
+    (43.555425, 27.826786),
+    (43.556182, 27.827557),
+    (43.556217, 27.827538),
+    (43.556559, 27.826893),
+]
 
-def angle_of_segment(p1, p2):
-    delta = p2 - p1
-    angle_rad = np.arctan2(delta[1], delta[0])
-    return np.degrees(angle_rad)
+# ---- Utility functions ----
 
-def generate_parallel_lines(polygon: Polygon, line_width_m: float, angle_deg: float):
-    # Approximate meters to degrees latitude (~0.000009 deg per meter)
-    spacing_deg = line_width_m * 0.000009
+def latlon_to_utm(polygon_latlon):
+    """Convert list of (lat, lon) to list of (x, y) UTM"""
+    return [to_utm.transform(lon, lat) for lat, lon in polygon_latlon]
 
-    # Rotate polygon so lines are horizontal (0 deg)
-    rotated = rotate(polygon, -angle_deg, origin='centroid', use_radians=False)
-    minx, miny, maxx, maxy = rotated.bounds
+def utm_to_latlon(coords_utm):
+    """Convert list of (x, y) UTM to (lat, lon)"""
+    return [(to_latlon.transform(x, y)[1], to_latlon.transform(x, y)[0]) for x, y in coords_utm]
 
-    lines = []
-    y = miny
-    while y <= maxy:
-        base_line = LineString([(minx, y), (maxx, y)])
-        # Rotate line back to original orientation
-        rotated_line = rotate(base_line, angle_deg, origin='centroid', use_radians=False)
-        clipped = rotated_line.intersection(polygon)
+def generate_headland_passes(field_poly, mower_width, num_passes):
+    """Generate list of inward offset polygons for headland passes"""
+    passes = []
+    for i in range(num_passes):
+        offset_dist = -mower_width * (i + 1)
+        offset_poly = field_poly.buffer(offset_dist)
+        if offset_poly.is_empty or not offset_poly.is_valid:
+            break
+        # If MultiPolygon from buffering, unify it to one polygon
+        if offset_poly.geom_type == 'MultiPolygon':
+            offset_poly = unary_union(offset_poly)
+        passes.append(offset_poly)
+    return passes
+
+def angle_between_points(p1, p2):
+    """Calculate angle in degrees between horizontal axis and line p1->p2"""
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    angle_rad = math.atan2(dy, dx)
+    return math.degrees(angle_rad)
+
+def generate_parallel_tracks(polygon, mower_width, driving_angle_deg):
+    """
+    Generate parallel mowing lines inside polygon
+    spaced by mower_width, oriented by driving_angle_deg
+    """
+    bounds = polygon.bounds  # minx, miny, maxx, maxy
+    minx, miny, maxx, maxy = bounds
+    # Rotate polygon so mowing lines are vertical (parallel to Y axis)
+    rotated = affinity.rotate(polygon, -driving_angle_deg, origin='centroid', use_radians=False)
+    rotated_bounds = rotated.bounds
+    r_minx, r_miny, r_maxx, r_maxy = rotated_bounds
+
+    tracks = []
+    x = r_minx
+    while x <= r_maxx:
+        # create vertical line at x spanning polygon height
+        line = LineString([(x, r_miny), (x, r_maxy)])
+        # intersect with polygon
+        clipped = line.intersection(rotated)
         if clipped.is_empty:
-            y += spacing_deg
+            x += mower_width
             continue
-        if clipped.geom_type == "MultiLineString":
+        # clipped can be LineString or MultiLineString
+        if clipped.geom_type == 'MultiLineString':
             for segment in clipped.geoms:
-                lines.append(list(segment.coords))
-        elif clipped.geom_type == "LineString":
-            lines.append(list(clipped.coords))
-        y += spacing_deg
-    return lines
+                tracks.append(segment)
+        elif clipped.geom_type == 'LineString':
+            tracks.append(clipped)
+        x += mower_width
 
-def lines_to_kml(lines, kml_filename="waypoints.kml"):
+    # Rotate tracks back to original orientation
+    tracks_rotated_back = [affinity.rotate(track, driving_angle_deg, origin='centroid', use_radians=False) for track in tracks]
+
+    return tracks_rotated_back
+
+def tracks_to_latlon(tracks):
+    """Convert list of shapely linestrings in UTM to latlon coords"""
+    all_tracks_latlon = []
+    for line in tracks:
+        coords_utm = list(line.coords)
+        coords_latlon = utm_to_latlon(coords_utm)
+        all_tracks_latlon.append(coords_latlon)
+    return all_tracks_latlon
+
+def export_kml(tracks_latlon):
     kml = simplekml.Kml()
-    for idx, line in enumerate(lines):
-        ls = kml.newlinestring(name=f"Line {idx+1}", coords=line)
+    for idx, track in enumerate(tracks_latlon):
+        ls = kml.newlinestring(name=f"Track {idx+1}", coords=[(lon, lat) for lat, lon in track])
         ls.style.linestyle.color = simplekml.Color.red
-        ls.style.linestyle.width = 3
-    kml_bytes = kml.kml()
+        ls.style.linestyle.width = 2
+    kml_bytes = io.BytesIO()
+    kml.save(kml_bytes)
+    kml_bytes.seek(0)
     return kml_bytes
 
-def create_map(boundary, lines, show=True):
-    if not show:
-        return None
-    center_lat = np.mean([pt[0] for pt in boundary])
-    center_lon = np.mean([pt[1] for pt in boundary])
-    m = Map(location=[center_lat, center_lon], zoom_start=17)
+def plot_map(field_latlon, headlands, tracks_latlon):
+    # Center map roughly on field centroid
+    lats = [pt[0] for pt in field_latlon]
+    lons = [pt[1] for pt in field_latlon]
+    center = (sum(lats) / len(lats), sum(lons) / len(lons))
 
-    # Draw polygon
-    FoliumPolygon(locations=boundary, color="green", fill=True, fill_opacity=0.3, weight=3).add_to(m)
+    m = folium.Map(location=center, zoom_start=18)
 
-    # Draw lines
-    for line in lines:
-        FoliumPolyline = PolyLine(locations=line, color="blue", weight=2)
-        FoliumPolyline.add_to(m)
+    # Draw field polygon
+    folium.Polygon(field_latlon, color='green', fill=True, fill_opacity=0.3, popup="Field Boundary").add_to(m)
+
+    # Draw headland passes
+    for idx, poly in enumerate(headlands):
+        latlon = utm_to_latlon(list(poly.exterior.coords))
+        folium.Polygon(latlon, color='orange', fill=False, weight=2, popup=f"Headland Pass {idx+1}").add_to(m)
+
+    # Draw mowing tracks
+    for idx, track in enumerate(tracks_latlon):
+        folium.PolyLine(track, color='blue', weight=2, popup=f"Track {idx+1}").add_to(m)
 
     return m
 
+# ---- Streamlit app ----
+
 def main():
-    st.title("Football Grass Field Waypoint Generator")
+    st.title("Autonomous Grass Cutting Path Generator")
 
     st.markdown("""
-    Input the grass field boundary as a list of latitude,longitude points (non-rectangular allowed).
-    Select mower operating width and driving course pattern.
-    Generate waypoints and optionally show them on the map.
-    Export waypoints as a KML file for robot navigation.
+    This tool generates mowing paths based on stadium boundaries, mower width, headland passes, and driving direction.
+    Coordinates are processed in UTM (meters) for accuracy.
     """)
 
-    default_boundary = [
-        (43.699047, 27.840622),
-        (43.699011, 27.841512),
-        (43.699956, 27.841568),
-        (43.699999, 27.840693),
-        (43.699800, 27.840500),  # added extra points to simulate a polygon with >4 points
-        (43.699500, 27.840400),
-        (43.699200, 27.840450),
-        (43.699000, 27.840500)
-    ]
-
-    boundary_input = st.text_area(
-        "Enter polygon vertices as lat,lon per line",
-        value="\n".join([f"{lat},{lon}" for lat, lon in default_boundary]),
-        height=150
-    )
-
+    # Input polygon coords
+    input_coords_str = st.text_area("Field boundary coordinates (lat, lon per line, comma-separated):",
+                                   value="\n".join([f"{lat}, {lon}" for lat, lon in DEFAULT_BOUNDARY_LATLON]),
+                                   height=140)
+    coords_lines = input_coords_str.strip().split("\n")
     try:
-        boundary = []
-        for line in boundary_input.strip().split("\n"):
-            lat_str, lon_str = line.strip().split(",")
-            boundary.append((float(lat_str), float(lon_str)))
-        if len(boundary) < 3:
-            st.error("Please enter at least 3 vertices.")
-            return
-    except Exception as e:
-        st.error(f"Error parsing coordinates: {e}")
+        boundary_latlon = [tuple(map(float, line.strip().split(","))) for line in coords_lines]
+    except Exception:
+        st.error("Invalid coordinates format!")
         return
 
-    mower_width = st.number_input("Mower operating width (meters)", min_value=0.5, max_value=10.0, value=2.0, step=0.1)
+    mower_width = st.number_input("Mower operating width (meters):", min_value=0.5, max_value=10.0, value=2.0, step=0.1)
+    num_headland = st.number_input("Number of headland passes:", min_value=0, max_value=10, value=2, step=1)
 
-    course_type = st.selectbox(
-        "Driving Course Pattern",
-        options=["parallel to longest side", "perpendicular to longest side", "checkerboard", "diagonal"]
-    )
+    # Select driving direction by picking two boundary points
+    st.markdown("Select driving direction (line between two boundary vertices):")
+    idx1 = st.number_input("First vertex index (0-based):", min_value=0, max_value=len(boundary_latlon)-1, value=0)
+    idx2 = st.number_input("Second vertex index (0-based):", min_value=0, max_value=len(boundary_latlon)-1, value=1)
+    if idx1 == idx2:
+        st.error("Select two different vertices for driving direction.")
+        return
 
-    show_map = st.checkbox("Show map visualization", value=True)
+    show_map = st.checkbox("Show generated map", value=True)
 
-    if st.button("Generate Waypoints"):
-        polygon = Polygon(boundary)
-        longest_seg = find_longest_edge(polygon)
-        p1, p2 = longest_seg
-        longest_angle = angle_of_segment(p1, p2)
+    if st.button("Generate Paths"):
+        # Convert boundary to UTM polygon
+        boundary_utm = latlon_to_utm(boundary_latlon)
+        field_poly = Polygon(boundary_utm)
+        if not field_poly.is_valid:
+            st.warning("Warning: Field polygon is invalid. Please check coordinates.")
 
-        st.write(f"Longest side angle: {longest_angle:.2f} degrees")
+        # Generate headland passes
+        headland_polys = generate_headland_passes(field_poly, mower_width, num_headland)
 
-        if course_type == "parallel to longest side":
-            lines = generate_parallel_lines(polygon, mower_width, longest_angle)
-        elif course_type == "perpendicular to longest side":
-            perp_angle = (longest_angle + 90) % 360
-            lines = generate_parallel_lines(polygon, mower_width, perp_angle)
-        elif course_type == "checkerboard":
-            lines1 = generate_parallel_lines(polygon, mower_width, longest_angle)
-            perp_angle = (longest_angle + 90) % 360
-            lines2 = generate_parallel_lines(polygon, mower_width, perp_angle)
-            lines = lines1 + lines2
-        elif course_type == "diagonal":
-            if len(boundary) >= 3:
-                diag_angle = angle_of_segment(np.array(boundary[0]), np.array(boundary[2]))
-                lines = generate_parallel_lines(polygon, mower_width, diag_angle)
-            else:
-                lines = []
-        else:
-            lines = []
+        # Inner polygon for mowing tracks
+        inner_poly = headland_polys[-1] if headland_polys else field_poly
 
-        st.success(f"Generated {len(lines)} waypoint lines.")
+        # Calculate driving direction angle in UTM
+        p1 = boundary_utm[idx1]
+        p2 = boundary_utm[idx2]
+        driving_angle = angle_between_points(p1, p2)
 
-        kml_bytes = lines_to_kml(lines)
+        # Generate mowing tracks inside inner polygon
+        tracks = generate_parallel_tracks(inner_poly, mower_width, driving_angle)
+        tracks_latlon = tracks_to_latlon(tracks)
 
-        st.download_button(
-            label="Download KML file",
-            data=kml_bytes,
-            file_name="waypoints.kml",
-            mime="application/vnd.google-earth.kml+xml"
-        )
-
+        # Map visualization
         if show_map:
-            m = create_map(boundary, lines, show=True)
-            st_data = st_folium(m, width=700, height=500)
-        else:
-            st.info("Map visualization is disabled.")
+            m = plot_map(boundary_latlon, headland_polys, tracks_latlon)
+            st_folium(m, width=700, height=500)
+
+        # Export KML
+        kml_bytes = export_kml(tracks_latlon)
+        st.download_button("Download KML file", kml_bytes, file_name="mowing_tracks.kml", mime="application/vnd.google-earth.kml+xml")
 
 if __name__ == "__main__":
     main()
