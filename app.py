@@ -1,97 +1,88 @@
-import streamlit as st
-import simplekml
+import geopandas as gpd
 import numpy as np
-from shapely.geometry import Polygon
-import pyproj  # Coordinate transformation for UTM
+from shapely.geometry import Polygon, LineString, Point
 
-# Function to convert lat/lon to UTM
-def latlon_to_utm(lat, lon):
-    wgs84 = pyproj.CRS("EPSG:4326")  # WGS84 (Lat/Lon)
-    utm = pyproj.CRS("EPSG:32633")  # UTM zone 33N
-    transformer = pyproj.Transformer.from_crs(wgs84, utm, always_xy=True)
-    return transformer.transform(lon, lat)
+def generate_headland_passes(field_boundary, operating_width, num_headland_passes):
+    """
+    Generates headland passes around the outer boundary of the field.
+    These will be parallel to the field's boundary and will be offset by the mower's width.
+    """
+    headland_passes = []
+    for i in range(num_headland_passes):
+        offset_distance = operating_width * i  # Offset distance for each pass
+        headland_pass = field_boundary.parallel_offset(offset_distance, side='left')
+        headland_passes.append(headland_pass)
+    return headland_passes
 
-# Function to generate parallel lines for mowing
-def generate_parallel_lines(polygon, mower_width, direction_angle=0, headland_passes=2):
-    """Generate parallel mowing lines inside polygon"""
-    minx, miny, maxx, maxy = polygon.bounds
-    lines = []
+def generate_tracks(field_boundary, driving_direction, operating_width):
+    """
+    Generates tracks that are parallel to the driving direction inside the field.
+    """
+    tracks = []
+    field_bounds = field_boundary.bounds  # Get the bounds of the field
+    min_x, min_y, max_x, max_y = field_bounds
     
-    # Convert direction angle to radians
-    angle_rad = np.radians(direction_angle)
-    
-    # Generate headland passes (parallel to the field boundary)
-    for i in range(headland_passes):
-        offset = i * mower_width
-        line = [(minx + offset, miny), (minx + offset, maxy)]
-        lines.append(line)
-    
-    # Generate mowing lines in the field area after headland passes
-    x = minx + mower_width / 2  # Start position for mowing
-    while x <= maxx:
-        line = [(x, miny), (x, maxy)]
-        lines.append(line)
-        x += mower_width
+    # Depending on the driving direction, generate tracks (parallel to the long axis or short axis)
+    if driving_direction == 'long':  # Parallel to the long axis (touchline)
+        y_start = min_y
+        y_end = max_y
+        while y_start < y_end:
+            track = LineString([(min_x, y_start), (max_x, y_start)])
+            tracks.append(track)
+            y_start += operating_width  # Increment by the mower width
+    else:  # Parallel to the short axis (goal line)
+        x_start = min_x
+        x_end = max_x
+        while x_start < x_end:
+            track = LineString([(x_start, min_y), (x_start, max_y)])
+            tracks.append(track)
+            x_start += operating_width  # Increment by the mower width
+    return tracks
 
-    return lines
+def find_intersections(headland_passes, tracks):
+    """
+    Find intersections between headland passes and the generated tracks.
+    """
+    intersections = []
+    for track in tracks:
+        for pass_ in headland_passes:
+            if track.intersects(pass_):
+                intersection_point = track.intersection(pass_)
+                intersections.append(intersection_point)
+    return intersections
 
-# Function to create KML from generated lines
-def create_kml(lines, task_name):
-    kml = simplekml.Kml()
-    for idx, line in enumerate(lines):
-        ls = kml.newlinestring(name=f"{task_name} Line {idx + 1}", coords=[(lon, lat) for lat, lon in line])
-        ls.style.linestyle.color = simplekml.Color.blue if task_name == "Grass Cutting" else simplekml.Color.green
-        ls.style.linestyle.width = 3
-    return kml.kml().encode('utf-8')
+def save_to_shapefile(headland_passes, tracks, intersections, output_filename):
+    """
+    Saves the generated passes, tracks, and intersections into a shapefile.
+    """
+    all_geometries = headland_passes + tracks + intersections
+    gdf = gpd.GeoDataFrame(geometry=all_geometries)
+    gdf.to_file(output_filename)
 
-# Main app
 def main():
-    st.title("Football Field Grass Cutting and Striping Generator")
+    # Example Inputs:
+    field_coords = [(43.555830, 27.826090), (43.555775, 27.826100), (43.555422, 27.826747),
+                    (43.555425, 27.826786), (43.556182, 27.827557), (43.556217, 27.827538),
+                    (43.556559, 27.826893), (43.556547, 27.826833)]
+    field_polygon = Polygon(field_coords)  # Create polygon from coordinates
+    operating_width = 2  # Mower operating width in meters
+    num_headland_passes = 2  # Example number of headland passes
+    driving_direction = 'long'  # 'long' for touchline direction, 'short' for goal line
+    
+    # Step 1: Load inputs and create field polygon
+    # (This is already done above with field_polygon)
 
-    st.markdown("### Input Grass Field Boundary (lat, lon) Coordinates")
-    default_coords = """43.555830, 27.826090
-43.555775, 27.826100
-43.555422, 27.826747
-43.555425, 27.826786
-43.556182, 27.827557
-43.556217, 27.827538
-43.556559, 27.826893
-43.556547, 27.826833"""
-    
-    coords_text = st.text_area("Enter coordinates (lat, lon), one per line:", value=default_coords, height=150)
-    field_coords = []
-    
-    # Parse the input coordinates
-    for line in coords_text.split("\n"):
-        try:
-            lat, lon = map(float, line.strip().split(","))
-            field_coords.append((lat, lon))
-        except ValueError:
-            continue
-    
-    # Validate coordinates
-    if len(field_coords) < 3:
-        st.warning("Please enter at least 3 coordinates to form a polygon.")
-        return
-    
-    # Convert lat/lon to UTM and create Polygon
-    polygon_coords = [latlon_to_utm(lat, lon) for lat, lon in field_coords]
-    polygon = Polygon(polygon_coords)
+    # Step 2: Generate headland passes
+    headland_passes = generate_headland_passes(field_polygon, operating_width, num_headland_passes)
 
-    st.markdown("### Operational Parameters")
-    mower_width = st.number_input("Grass Mower Operating Width (meters)", min_value=0.5, max_value=10.0, value=2.0, step=0.1)
-    headland_passes = st.number_input("Number of Headland Passes", min_value=1, max_value=5, value=2, step=1)
-    mowing_direction = st.number_input("Mowing Direction Angle (degrees)", min_value=0, max_value=360, value=0, step=5)
+    # Step 3: Generate tracks parallel to the driving direction
+    tracks = generate_tracks(field_polygon, driving_direction, operating_width)
 
-    if st.button("Generate Waypoints"):
-        # Generate waypoints for grass cutting task
-        grass_lines = generate_parallel_lines(polygon, mower_width, direction_angle=mowing_direction, headland_passes=headland_passes)
-        
-        # Create KML for grass cutting
-        grass_kml = create_kml(grass_lines, "Grass Cutting")
-        
-        # Provide KML download button
-        st.download_button("Download Grass Cutting KML", grass_kml, "grass_cutting.kml", "application/vnd.google-earth.kml+xml")
+    # Step 4: Find intersections between tracks and headland passes
+    intersections = find_intersections(headland_passes, tracks)
+
+    # Step 5: Save generated waypoints to shapefile
+    save_to_shapefile(headland_passes, tracks, intersections, "output_field.shp")
 
 if __name__ == "__main__":
     main()
