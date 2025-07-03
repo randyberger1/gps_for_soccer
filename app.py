@@ -7,15 +7,20 @@ def generate_headland_passes(field_boundary, operating_width, num_passes):
     Each pass is offset from the previous one, moving inward.
     """
     headland_passes = []
+    
+    # Convert the polygon's exterior boundary to a LineString
+    boundary_line = field_boundary.exterior
+    
     # Start with the field boundary as the first headland pass
-    current_boundary = field_boundary
+    current_boundary = boundary_line
     for i in range(num_passes):
-        # Generate the next pass by offsetting the boundary
+        # Generate the next pass by offsetting the boundary (parallel offset)
         # 'side' can be 'left' or 'right', we can alternate if necessary
         current_pass = current_boundary.parallel_offset(operating_width, side='left', resolution=16)
         headland_passes.append(current_pass)
         
         # Update the boundary for the next pass (move inward)
+        # After applying the offset, we want the next pass to be generated inside
         current_boundary = current_pass
 
     return headland_passes
